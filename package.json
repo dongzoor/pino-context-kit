@@ -1,0 +1,45 @@
+{
+  "name": "pino-context-kit",
+  "version": "0.1.0",
+  "license": "MIT",
+  "author": "dongzoor",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dongzoor/pino-context-kit.git"
+  },
+  "homepage": "https://github.com/dongzoor/pino-context-kit",
+  "bugs": {
+    "url": "https://github.com/dongzoor/pino-context-kit/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "description": "AsyncLocalStorage context for native Pino loggers",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "packageManager": "pnpm@10.26.2",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm build && node --experimental-strip-types --test test/*.test.mjs",
+    "test:watch": "node --experimental-strip-types --test --watch test/*.test.mjs",
+    "prepack": "pnpm build"
+  },
+  "dependencies": {
+    "pino": "^10.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "~5.9.3"
+  }
+}

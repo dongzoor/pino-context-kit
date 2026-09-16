@@ -45,6 +45,7 @@ pipeline {
     RELEASE_DIR = "${WORKSPACE}/java/target/release"
     // The container runs as the node's uid without a passwd entry; give Java a real user.home.
     MAVEN_OPTS = "-Duser.home=${WORKSPACE}/.ci/home"
+    MAVEN_CONFIG = "${WORKSPACE}/.ci/home/.m2"
   }
 
   stages {
@@ -146,7 +147,13 @@ pipeline {
       }
       post {
         always {
-          junit testResults: 'java/target/surefire-reports/*.xml', allowEmptyResults: false
+          script {
+            def interruptedWithoutReports = currentBuild.currentResult == 'ABORTED' &&
+              sh(script: 'for file in java/target/surefire-reports/*.xml; do [ ! -f "$file" ] || exit 0; done; exit 1', returnStatus: true) != 0
+            if (!interruptedWithoutReports) {
+              junit testResults: 'java/target/surefire-reports/*.xml', allowEmptyResults: false
+            }
+          }
         }
       }
     }
@@ -245,27 +252,58 @@ pipeline {
     stage('Consume published artifact') {
       when { expression { return params.PUBLISH } }
       steps {
-        withCredentials([
-          string(credentialsId: 'pino-context-kit-maven-url', variable: 'MAVEN_REGISTRY_URL'),
-          string(credentialsId: 'pino-context-kit-maven-read', variable: 'MAVEN_REGISTRY_TOKEN')
-        ]) {
+        withCredentials([string(credentialsId: 'pino-context-kit-maven-url', variable: 'MAVEN_REGISTRY_URL')]) {
+          withCredentials([string(credentialsId: 'pino-context-kit-maven-read', variable: 'MAVEN_REGISTRY_TOKEN')]) {
+            withDockerContainer(image: env.MAVEN_IMAGE_ID) {
+              sh '''#!/bin/sh
+                set -eu
+                # Download opaque files and verify them BEFORE Maven interprets the POM or loads code.
+                download_dir="$CI_DIR/registry-download"
+                mkdir -p "$download_dir"
+                group_path=$(printf '%s' "$PROJECT_GROUP_ID" | tr . /)
+                artifact_url="${MAVEN_REGISTRY_URL%/}/$group_path/$PROJECT_ARTIFACT_ID/$PROJECT_VERSION"
+                token_escaped=$(printf '%s' "$MAVEN_REGISTRY_TOKEN" | sed 's/[\\"]/\\&/g')
+                for file_name in "$JAR_NAME" "$POM_NAME"; do
+                  status=$(printf 'header = "Deploy-Token: %s"\\n' "$token_escaped" \\
+                    | curl --silent --show-error --config - --max-time 60 \\
+                        --output "$download_dir/$file_name" --write-out '%{http_code}' "$artifact_url/$file_name")
+                  [ "$status" = 200 ] || { echo "Registry download returned HTTP $status" >&2; exit 1; }
+                done
+                cd "$download_dir"
+                sha256sum -c "$RELEASE_DIR/SHA256SUMS"
+              '''
+            }
+          }
+          // Only the registry URL remains bound. No package token enters this new container.
           withDockerContainer(image: env.MAVEN_IMAGE_ID) {
-            // No `set -x` here: MAVEN_REGISTRY_URL / MAVEN_REGISTRY_TOKEN are secrets.
+            writeFile file: '.ci/public-settings.xml', text: '''<settings xmlns="http://maven.apache.org/SETTINGS/1.2.0">
+  <mirrors><mirror><id>public-central</id><mirrorOf>*</mirrorOf>
+    <url>https://repo.maven.apache.org/maven2</url>
+  </mirror></mirrors>
+</settings>
+'''
             sh '''#!/bin/sh
               set -eu
-              # Fresh local repository: the artifact must come from the registry, not from the build cache.
+              test -z "${MAVEN_REGISTRY_TOKEN:-}"
               consume_repo="$CI_DIR/consume-repository"
               rm -rf "$consume_repo"
               mkdir -p "$consume_repo"
-              mvn -B -ntp -s java/maven-settings.xml -Dmaven.repo.local="$consume_repo" \\
+              # Seed only the verified REGISTRY downloads, never the locally built artifacts.
+              mvn -B -ntp -s "$CI_DIR/public-settings.xml" -Dmaven.repo.local="$consume_repo" \\
+                org.apache.maven.plugins:maven-install-plugin:3.1.4:install-file \\
+                -Dfile="$CI_DIR/registry-download/$JAR_NAME" -DpomFile="$CI_DIR/registry-download/$POM_NAME"
+              # Public dependencies/plugins come exclusively from HTTPS Central, without a registry token.
+              mvn -B -ntp -s "$CI_DIR/public-settings.xml" -Dmaven.repo.local="$consume_repo" \\
                 -f java/examples/maven/pom.xml -DpinoContextKitVersion="$PROJECT_VERSION" \\
-                compile exec:java
-
+                org.apache.maven.plugins:maven-dependency-plugin:3.8.1:go-offline
               group_path=$(printf '%s' "$PROJECT_GROUP_ID" | tr . /)
-              downloaded="$consume_repo/$group_path/$PROJECT_ARTIFACT_ID/$PROJECT_VERSION/$JAR_NAME"
-              test -f "$downloaded" || { echo "Consumer did not download $JAR_NAME from the registry" >&2; exit 1; }
-              printf '%s  %s\\n' "$JAR_SHA256" "$downloaded" | sha256sum -c -
-              echo "Consumer verified $PROJECT_ARTIFACT_ID:$PROJECT_VERSION with sha256 $JAR_SHA256"
+              cd "$consume_repo/$group_path/$PROJECT_ARTIFACT_ID/$PROJECT_VERSION"
+              sha256sum -c "$RELEASE_DIR/SHA256SUMS"
+              cd "$WORKSPACE"
+              # Offline execution cannot replace the files checked above or send credentials.
+              mvn -o -B -ntp -s "$CI_DIR/public-settings.xml" -Dmaven.repo.local="$consume_repo" \\
+                -f java/examples/maven/pom.xml -DpinoContextKitVersion="$PROJECT_VERSION" compile exec:java
+              echo "Consumer verified JAR and POM for $PROJECT_ARTIFACT_ID:$PROJECT_VERSION ($JAR_SHA256)"
             '''
           }
         }

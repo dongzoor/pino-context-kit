@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Maven consumer of the published io.github.dongzoor:pino-context-kit artifact.
+  Compiles ../ContextExample.java against the artifact resolved from the team
+  registry and runs it. Run from the repository root:
+
+    mvn -s java/maven-settings.xml -f java/examples/maven/pom.xml compile exec:java
+
+  Override the consumed version with -DpinoContextKitVersion=<version>.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>io.github.dongzoor.examples</groupId>
+  <artifactId>pino-context-kit-maven-example</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+  <name>Pino Context Kit Maven consumer example</name>
+  <properties>
+    <maven.compiler.release>11</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <pinoContextKitVersion>0.1.0</pinoContextKitVersion>
+  </properties>
+  <repositories>
+    <!-- Routed and authenticated by the gitlab-maven-http mirror in java/maven-settings.xml. -->
+    <repository>
+      <id>gitlab-maven</id>
+      <url>${env.MAVEN_REGISTRY_URL}</url>
+      <snapshots>
+        <enabled>false</enabled>
+      </snapshots>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>io.github.dongzoor</groupId>
+      <artifactId>pino-context-kit</artifactId>
+      <version>${pinoContextKitVersion}</version>
+    </dependency>
+    <dependency>
+      <groupId>ch.qos.logback</groupId>
+      <artifactId>logback-classic</artifactId>
+      <version>1.5.38</version>
+      <scope>runtime</scope>
+    </dependency>
+  </dependencies>
+  <build>
+    <!-- Reuse the shared example instead of copying it; only the root-level file compiles. -->
+    <sourceDirectory>${project.basedir}/..</sourceDirectory>
+    <resources>
+      <resource>
+        <directory>${project.basedir}/..</directory>
+        <includes>
+          <include>logback.xml</include>
+        </includes>
+      </resource>
+    </resources>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.14.1</version>
+        <configuration>
+          <includes>
+            <include>ContextExample.java</include>
+          </includes>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.6.4</version>
+        <configuration>
+          <mainClass>ContextExample</mainClass>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

@@ -1,3 +1,7 @@
 /dist/
 /*.tgz
 /node_modules/
+/java/target/
+/java/examples/maven/target/
+/java/examples/gradle/.gradle/
+/java/examples/gradle/build/

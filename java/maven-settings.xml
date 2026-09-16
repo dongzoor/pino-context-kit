@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Team registry access for the Java consumers under java/examples.
+  Use with: mvn -s java/maven-settings.xml ...
+
+  Requires two environment variables supplied privately (never committed):
+    MAVEN_REGISTRY_URL    Maven package registry URL of the private GitLab project
+    MAVEN_REGISTRY_TOKEN  deploy token with read_package_registry (and write for publishing)
+
+  HTTP does not encrypt the token or packages. Use this exception only on a
+  trusted internal network; it does not make transport confidential.
+
+  Only the repository with id "gitlab-maven" is routed to this registry. Maven's
+  default HTTP blocker (mirrorOf external:http:*) stays in effect for every other
+  repository because an exact-id mirror match takes precedence over the pattern.
+-->
+<settings xmlns="http://maven.apache.org/SETTINGS/1.2.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.2.0 https://maven.apache.org/xsd/settings-1.2.0.xsd">
+  <servers>
+    <server>
+      <id>gitlab-maven-http</id>
+      <configuration>
+        <httpHeaders>
+          <property>
+            <name>Deploy-Token</name>
+            <value>${env.MAVEN_REGISTRY_TOKEN}</value>
+          </property>
+        </httpHeaders>
+      </configuration>
+    </server>
+  </servers>
+  <mirrors>
+    <mirror>
+      <id>gitlab-maven-http</id>
+      <mirrorOf>gitlab-maven</mirrorOf>
+      <url>${env.MAVEN_REGISTRY_URL}</url>
+      <blocked>false</blocked>
+    </mirror>
+  </mirrors>
+</settings>

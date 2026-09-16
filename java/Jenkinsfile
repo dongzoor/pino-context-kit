@@ -56,14 +56,15 @@ pipeline {
           # Clean this job's own workspace, keeping only the dependency cache.
           find . -mindepth 1 -maxdepth 1 ! -name .m2-cache -exec rm -rf {} +
         '''
-        checkout scm
         script {
+          def checkoutState = checkout scm
+          env.CHECKOUT_BRANCH = checkoutState.GIT_BRANCH
           env.GIT_HEAD = sh(script: 'git rev-parse --verify HEAD', returnStdout: true).trim()
           if (!(env.GIT_HEAD ==~ /[0-9a-f]{40}/)) {
             error "Could not determine the checked out commit: '${env.GIT_HEAD}'"
           }
           currentBuild.description = "commit ${env.GIT_HEAD.substring(0, 12)}"
-          echo "Building commit ${env.GIT_HEAD}"
+          echo "Building commit ${env.GIT_HEAD} from ${env.CHECKOUT_BRANCH}"
         }
       }
     }
@@ -177,7 +178,7 @@ pipeline {
           set -eu
           # Fail closed: publish only the commit that is both origin/main (as fetched by the trusted
           # SCM checkout) and the release tag for the version in java/pom.xml.
-          branch="${BRANCH_NAME:-${GIT_BRANCH:-}}"
+          branch="${CHECKOUT_BRANCH:-}"
           case "$branch" in
             main|origin/main|refs/heads/main|refs/remotes/origin/main) ;;
             *) echo "Refusing to publish from branch '$branch'; only main may publish" >&2; exit 1 ;;

@@ -5,3 +5,5 @@
 /java/examples/maven/target/
 /java/examples/gradle/.gradle/
 /java/examples/gradle/build/
+/.ci/
+/.m2-cache/

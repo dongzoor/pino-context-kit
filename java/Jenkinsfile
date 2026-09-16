@@ -1,0 +1,275 @@
+// Jenkins pipeline for the Java module (java/): build, test, archive, and optionally publish
+// io.github.dongzoor:pino-context-kit to the internal GitLab Maven package registry.
+//
+// Operating notes (job settings live in Jenkins, never in this file):
+//   * Job type: Pipeline "from SCM", pinned to the trusted repository and branch `main`,
+//     script path `java/Jenkinsfile`. Repository URL, branch and credentials are never parameters.
+//   * First run: PUBLISH=false (CI only: build, tests, archive).
+//   * Release: set <version> in java/pom.xml on main, tag that commit `java-v<VERSION>`, push branch
+//     and tag, then run with PUBLISH=true. Publishing requires HEAD == origin/main == the tag,
+//     a non-SNAPSHOT version, and that the version does not already exist in the registry.
+//   * Jenkins "Secret text" credentials (IDs only; values are never stored in the repository):
+//       pino-context-kit-maven-url      -> MAVEN_REGISTRY_URL   registry base URL
+//                                          (GitLab: <gitlab>/api/v4/projects/<project-id>/packages/maven)
+//       pino-context-kit-maven-publish  -> MAVEN_REGISTRY_TOKEN read/write_package_registry deploy token
+//       pino-context-kit-maven-read     -> MAVEN_REGISTRY_TOKEN deploy token with read_package_registry
+//     The registry authenticates with the `Deploy-Token` header configured in java/maven-settings.xml.
+//   * Node: the built-in node with Docker CLI + daemon and plugins docker-workflow, git,
+//     credentials-binding, junit. Nothing is installed on the node; all Maven/Java work runs in
+//     maven:3.9.11-eclipse-temurin-11, pinned per build to the pulled image ID. Containers started
+//     by withDockerContainer are removed when the block ends, including on abort.
+//   * Maven caches live inside this job's workspace (.m2-cache), never in the node's ~/.m2.
+
+pipeline {
+  agent { label 'built-in' }
+
+  options {
+    skipDefaultCheckout()
+    disableConcurrentBuilds()
+    timeout(time: 60, unit: 'MINUTES')
+    buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
+  }
+
+  parameters {
+    booleanParam(name: 'PUBLISH', defaultValue: false,
+      description: 'Publish the verified JAR to the internal Maven registry. Only from main with tag java-v<version> on HEAD.')
+  }
+
+  environment {
+    MAVEN_IMAGE = 'maven:3.9.11-eclipse-temurin-11'
+    // Dependency cache kept across builds of this job; workspace-local so the node's ~/.m2 is untouched.
+    MAVEN_CACHE_REPO = "${WORKSPACE}/.m2-cache/repository"
+    // Per-build scratch (project metadata, fresh consume repository); recreated every build.
+    CI_DIR = "${WORKSPACE}/.ci"
+    // Files that get archived: JAR, POM, SHA256SUMS, BUILD-INFO.txt. Never settings, caches or tokens.
+    RELEASE_DIR = "${WORKSPACE}/java/target/release"
+    // The container runs as the node's uid without a passwd entry; give Java a real user.home.
+    MAVEN_OPTS = "-Duser.home=${WORKSPACE}/.ci/home"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        sh '''#!/bin/sh
+          set -eux
+          # Clean this job's own workspace, keeping only the dependency cache.
+          find . -mindepth 1 -maxdepth 1 ! -name .m2-cache -exec rm -rf {} +
+        '''
+        checkout scm
+        script {
+          env.GIT_HEAD = sh(script: 'git rev-parse --verify HEAD', returnStdout: true).trim()
+          if (!(env.GIT_HEAD ==~ /[0-9a-f]{40}/)) {
+            error "Could not determine the checked out commit: '${env.GIT_HEAD}'"
+          }
+          currentBuild.description = "commit ${env.GIT_HEAD.substring(0, 12)}"
+          echo "Building commit ${env.GIT_HEAD}"
+        }
+      }
+    }
+
+    stage('Resolve Maven image') {
+      steps {
+        script {
+          sh 'docker pull "$MAVEN_IMAGE"'
+          env.MAVEN_IMAGE_ID = sh(script: 'docker image inspect --format \'{{.Id}}\' "$MAVEN_IMAGE"', returnStdout: true).trim()
+          if (!(env.MAVEN_IMAGE_ID ==~ /sha256:[0-9a-f]{64}/)) {
+            error "Unexpected image ID for ${env.MAVEN_IMAGE}: '${env.MAVEN_IMAGE_ID}'"
+          }
+          env.MAVEN_IMAGE_DIGEST = sh(script: 'docker image inspect --format \'{{join .RepoDigests ","}}\' "$MAVEN_IMAGE"', returnStdout: true).trim()
+          echo "Using ${env.MAVEN_IMAGE} as ${env.MAVEN_IMAGE_ID} (${env.MAVEN_IMAGE_DIGEST})"
+        }
+      }
+    }
+
+    stage('Build and verify') {
+      steps {
+        withDockerContainer(image: env.MAVEN_IMAGE_ID) {
+          sh '''#!/bin/sh
+            set -eux
+            rm -rf "$CI_DIR"
+            mkdir -p "$CI_DIR/home" "$MAVEN_CACHE_REPO"
+            for expression in project.groupId project.artifactId project.version; do
+              mvn -B -ntp -q -f java/pom.xml -Dmaven.repo.local="$MAVEN_CACHE_REPO" \\
+                org.apache.maven.plugins:maven-help-plugin:3.5.1:evaluate \\
+                -Dexpression="$expression" -DforceStdout > "$CI_DIR/$expression"
+            done
+          '''
+          script {
+            env.PROJECT_GROUP_ID = readFile('.ci/project.groupId').trim()
+            env.PROJECT_ARTIFACT_ID = readFile('.ci/project.artifactId').trim()
+            env.PROJECT_VERSION = readFile('.ci/project.version').trim()
+            if (!(env.PROJECT_GROUP_ID ==~ /[A-Za-z0-9_.-]+/) || !(env.PROJECT_ARTIFACT_ID ==~ /[A-Za-z0-9_.-]+/)) {
+              error "Unexpected Maven coordinates '${env.PROJECT_GROUP_ID}:${env.PROJECT_ARTIFACT_ID}'"
+            }
+            if (!(env.PROJECT_VERSION ==~ /[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?/)) {
+              error "Unexpected Maven project version '${env.PROJECT_VERSION}'"
+            }
+            env.JAR_NAME = "${env.PROJECT_ARTIFACT_ID}-${env.PROJECT_VERSION}.jar"
+            env.POM_NAME = "${env.PROJECT_ARTIFACT_ID}-${env.PROJECT_VERSION}.pom"
+            currentBuild.description = "commit ${env.GIT_HEAD.substring(0, 12)}, version ${env.PROJECT_VERSION}"
+            echo "Project ${env.PROJECT_GROUP_ID}:${env.PROJECT_ARTIFACT_ID}:${env.PROJECT_VERSION}"
+          }
+          sh '''#!/bin/sh
+            set -eux
+            mvn -B -ntp -f java/pom.xml -Dmaven.repo.local="$MAVEN_CACHE_REPO" verify
+          '''
+          sh '''#!/bin/sh
+            set -eux
+            # Stage the verified artifacts once; later stages only read these files.
+            test -f "java/target/$JAR_NAME"
+            rm -rf "$RELEASE_DIR"
+            mkdir -p "$RELEASE_DIR"
+            cp "java/target/$JAR_NAME" "$RELEASE_DIR/$JAR_NAME"
+            cp java/pom.xml "$RELEASE_DIR/$POM_NAME"
+            cd "$RELEASE_DIR"
+            sha256sum "$JAR_NAME" "$POM_NAME" > SHA256SUMS
+            sha256sum "$JAR_NAME" | cut -d ' ' -f 1 > "$CI_DIR/jar.sha256"
+            {
+              echo "commit=$GIT_HEAD"
+              echo "groupId=$PROJECT_GROUP_ID"
+              echo "artifactId=$PROJECT_ARTIFACT_ID"
+              echo "version=$PROJECT_VERSION"
+              echo "jarSha256=$(cat "$CI_DIR/jar.sha256")"
+              echo "mavenImage=$MAVEN_IMAGE"
+              echo "mavenImageId=$MAVEN_IMAGE_ID"
+              echo "mavenImageDigest=$MAVEN_IMAGE_DIGEST"
+            } > BUILD-INFO.txt
+            cat BUILD-INFO.txt
+          '''
+          script {
+            env.JAR_SHA256 = readFile('.ci/jar.sha256').trim()
+            if (!(env.JAR_SHA256 ==~ /[0-9a-f]{64}/)) {
+              error "Could not compute the JAR checksum: '${env.JAR_SHA256}'"
+            }
+          }
+        }
+      }
+      post {
+        always {
+          junit testResults: 'java/target/surefire-reports/*.xml', allowEmptyResults: false
+        }
+      }
+    }
+
+    stage('Archive') {
+      steps {
+        archiveArtifacts artifacts: 'java/target/release/*', fingerprint: true
+      }
+    }
+
+    stage('Release gate') {
+      when { expression { return params.PUBLISH } }
+      steps {
+        script {
+          if (env.PROJECT_VERSION.endsWith('-SNAPSHOT')) {
+            error "Refusing to publish SNAPSHOT version ${env.PROJECT_VERSION}"
+          }
+          env.RELEASE_TAG = "java-v${env.PROJECT_VERSION}"
+        }
+        sh '''#!/bin/sh
+          set -eu
+          # Fail closed: publish only the commit that is both origin/main (as fetched by the trusted
+          # SCM checkout) and the release tag for the version in java/pom.xml.
+          branch="${BRANCH_NAME:-${GIT_BRANCH:-}}"
+          case "$branch" in
+            main|origin/main|refs/heads/main|refs/remotes/origin/main) ;;
+            *) echo "Refusing to publish from branch '$branch'; only main may publish" >&2; exit 1 ;;
+          esac
+          head=$(git rev-parse --verify --quiet 'HEAD^{commit}')
+          main=$(git rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}') || {
+            echo "origin/main was not fetched by the checkout; cannot prove HEAD is main" >&2; exit 1
+          }
+          [ "$head" = "$GIT_HEAD" ] || { echo "HEAD moved since checkout ($head != $GIT_HEAD)" >&2; exit 1; }
+          [ "$head" = "$main" ] || { echo "HEAD $head is not origin/main $main" >&2; exit 1; }
+          tagged=$(git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG^{commit}") || {
+            echo "Tag $RELEASE_TAG is missing (not pushed, or tags not fetched by the job)" >&2; exit 1
+          }
+          [ "$head" = "$tagged" ] || { echo "Tag $RELEASE_TAG points to $tagged, not HEAD $head" >&2; exit 1; }
+          echo "Release gate passed: $RELEASE_TAG == origin/main == $head"
+        '''
+      }
+    }
+
+    stage('Publish') {
+      when { expression { return params.PUBLISH } }
+      steps {
+        withCredentials([
+          string(credentialsId: 'pino-context-kit-maven-url', variable: 'MAVEN_REGISTRY_URL'),
+          string(credentialsId: 'pino-context-kit-maven-publish', variable: 'MAVEN_REGISTRY_TOKEN')
+        ]) {
+          withDockerContainer(image: env.MAVEN_IMAGE_ID) {
+            // No `set -x` here: MAVEN_REGISTRY_URL / MAVEN_REGISTRY_TOKEN are secrets.
+            sh '''#!/bin/sh
+              set -eu
+              cd "$RELEASE_DIR"
+              sha256sum -c SHA256SUMS
+              cd "$WORKSPACE"
+
+              # Never overwrite a release: neither the JAR nor the POM of this version may exist yet
+              # (both must answer HTTP 404), so a partial earlier upload cannot be silently replaced.
+              # The token reaches curl through its config on stdin (quoted, with `"` and `\\` escaped),
+              # never through argv or a file.
+              group_path=$(printf '%s' "$PROJECT_GROUP_ID" | tr . /)
+              artifact_url="${MAVEN_REGISTRY_URL%/}/$group_path/$PROJECT_ARTIFACT_ID/$PROJECT_VERSION"
+              token_escaped=$(printf '%s' "$MAVEN_REGISTRY_TOKEN" | sed 's/[\\\\"]/\\\\&/g')
+              for file_name in "$JAR_NAME" "$POM_NAME"; do
+                status=$(printf 'header = "Deploy-Token: %s"\\n' "$token_escaped" \\
+                  | curl --silent --show-error --config - --max-time 60 \\
+                      --output /dev/null --write-out '%{http_code}' "$artifact_url/$file_name") || {
+                  echo "Registry probe for $file_name failed (network/TLS); refusing to publish" >&2; exit 1
+                }
+                case "$status" in
+                  404) echo "$file_name is not in the registry yet" ;;
+                  200) echo "$file_name already exists in the registry; refusing to overwrite" >&2; exit 1 ;;
+                  *) echo "Registry probe for $file_name returned HTTP $status (expected 404); refusing to publish" >&2; exit 1 ;;
+                esac
+              done
+
+              # Deploy the already verified JAR with the original POM; nothing is rebuilt.
+              mvn -B -ntp -s java/maven-settings.xml -Dmaven.repo.local="$MAVEN_CACHE_REPO" \\
+                org.apache.maven.plugins:maven-deploy-plugin:3.1.4:deploy-file \\
+                -DrepositoryId=gitlab-maven-http \\
+                -Durl="$MAVEN_REGISTRY_URL" \\
+                -Dfile="$RELEASE_DIR/$JAR_NAME" \\
+                -DpomFile="$RELEASE_DIR/$POM_NAME"
+
+              cd "$RELEASE_DIR"
+              sha256sum -c SHA256SUMS
+              echo "Published $PROJECT_GROUP_ID:$PROJECT_ARTIFACT_ID:$PROJECT_VERSION (jar sha256 $JAR_SHA256)"
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Consume published artifact') {
+      when { expression { return params.PUBLISH } }
+      steps {
+        withCredentials([
+          string(credentialsId: 'pino-context-kit-maven-url', variable: 'MAVEN_REGISTRY_URL'),
+          string(credentialsId: 'pino-context-kit-maven-read', variable: 'MAVEN_REGISTRY_TOKEN')
+        ]) {
+          withDockerContainer(image: env.MAVEN_IMAGE_ID) {
+            // No `set -x` here: MAVEN_REGISTRY_URL / MAVEN_REGISTRY_TOKEN are secrets.
+            sh '''#!/bin/sh
+              set -eu
+              # Fresh local repository: the artifact must come from the registry, not from the build cache.
+              consume_repo="$CI_DIR/consume-repository"
+              rm -rf "$consume_repo"
+              mkdir -p "$consume_repo"
+              mvn -B -ntp -s java/maven-settings.xml -Dmaven.repo.local="$consume_repo" \\
+                -f java/examples/maven/pom.xml -DpinoContextKitVersion="$PROJECT_VERSION" \\
+                compile exec:java
+
+              group_path=$(printf '%s' "$PROJECT_GROUP_ID" | tr . /)
+              downloaded="$consume_repo/$group_path/$PROJECT_ARTIFACT_ID/$PROJECT_VERSION/$JAR_NAME"
+              test -f "$downloaded" || { echo "Consumer did not download $JAR_NAME from the registry" >&2; exit 1; }
+              printf '%s  %s\\n' "$JAR_SHA256" "$downloaded" | sha256sum -c -
+              echo "Consumer verified $PROJECT_ARTIFACT_ID:$PROJECT_VERSION with sha256 $JAR_SHA256"
+            '''
+          }
+        }
+      }
+    }
+  }
+}
